@@ -9,32 +9,31 @@ from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 # ==========================
 # CONFIGURACIÓN
 # ==========================
-CSV_PATH = "labels.csv"
-IMAGE_DIR = "images"
-IMG_SIZE = (160, 160)
-BATCH_SIZE = 32
-EPOCHS = 25
-MODEL_PATH = "hand_fingers_model.keras"  # Changed from .h5 to .keras
-NUM_CLASSES = 2
+CSV_PATH = "labels.csv"  # Ruta del CSV con nombres de imágenes y etiquetas
+IMAGE_DIR = "images"      # Carpeta donde están todas las imágenes
+IMG_SIZE = (160, 160)      # Tamaño al que se redimensionarán las imágenes
+BATCH_SIZE = 32            # Tamaño de batch para entrenamiento
+EPOCHS = 25                # Número de épocas en fase 1
+MODEL_PATH = "hand_fingers_model.keras"  # Ruta/nombre del modelo final
+NUM_CLASSES = 2            # Número de clases a predecir
 
 
 def load_and_split_data():
     """
-    Carga el CSV y divide los datos usando sklearn para garantizar
-    que train y validación nunca se mezclen.
+    Carga el CSV que contiene rutas y etiquetas, construye rutas completas
+    y divide en entrenamiento/validación manteniendo proporciones de clases.
     """
     if not os.path.exists(CSV_PATH):
-        raise FileNotFoundError(f"No se encontró el archivo: {CSV_PATH}")
+        raise FileNotFoundError(f"No se encontró: {CSV_PATH}")
 
     df = pd.read_csv(CSV_PATH)
 
-    # Asegurarse que sean strings y enteros
-    filenames = df["filename"].astype(str).tolist()
-    labels = df["label"].astype(int).tolist()
+    filenames = df["filename"].astype(str).tolist()  # Asegurar strings
+    labels = df["label"].astype(int).tolist()         # Asegurar enteros
 
-    filepaths = [os.path.join(IMAGE_DIR, fn) for fn in filenames]
+    filepaths = [os.path.join(IMAGE_DIR, fn) for fn in filenames]  # Rutas absolutas
 
-    # Stratified split: Mantiene la proporción de clases en ambos sets
+    # División estratificada: mantiene proporción de clases
     train_paths, val_paths, train_labels, val_labels = train_test_split(
         filepaths, labels, test_size=0.2, random_state=42, stratify=labels
     )
@@ -44,23 +43,23 @@ def load_and_split_data():
 
 def preprocess_image(path, label):
     """
-    Lee la imagen y aplica el pre-procesamiento específico de MobileNetV2 (-1 a 1).
+    Lee una imagen desde la ruta, la decodifica, redimensiona y normaliza
+    según MobileNetV2 (rango -1 a 1).
     """
-    image = tf.io.read_file(path)
-    image = tf.image.decode_image(image, channels=3, expand_animations=False)
-    image.set_shape((None, None, 3))
-    image = tf.image.resize(image, IMG_SIZE)
+    image = tf.io.read_file(path)  # Leer archivo
+    image = tf.image.decode_image(image, channels=3, expand_animations=False)  # Decodificar
+    image.set_shape((None, None, 3))  # Forzar forma con 3 canales
+    image = tf.image.resize(image, IMG_SIZE)  # Redimensionar
 
-    # Preprocesamiento específico de MobileNetV2
-    image = preprocess_input(image)
+    image = preprocess_input(image)  # Normalización específica
 
     return image, label
 
 
 def augment(image, label):
     """
-    Augmentation ligera en CPU (brillo/contraste).
-    La rotación/zoom geométrica se hace en GPU dentro del modelo.
+    Aumentación leve en CPU: variaciones de brillo y contraste.
+    (Aumentos geométricos se hacen dentro del modelo en GPU).
     """
     image = tf.image.random_brightness(image, max_delta=0.1)
     image = tf.image.random_contrast(image, lower=0.9, upper=1.1)
@@ -68,51 +67,57 @@ def augment(image, label):
 
 
 def make_dataset(filepaths, labels, is_train=True):
+    """
+    Crea un pipeline tf.data eficiente con lectura, procesamiento,
+    augmentación y batching.
+    """
     ds = tf.data.Dataset.from_tensor_slices((filepaths, labels))
 
     if is_train:
-        ds = ds.shuffle(len(filepaths), seed=42)
+        ds = ds.shuffle(len(filepaths), seed=42)  # Mezclar datos
         ds = ds.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
         ds = ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
     else:
         ds = ds.map(preprocess_image, num_parallel_calls=tf.data.AUTOTUNE)
 
-    ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)  # Optimización
     return ds
 
 
 def create_model():
     """
-    Construye el modelo con Transfer Learning y Augmentation layers.
+    Construye un modelo con MobileNetV2 como base congelada y capas
+    de aumento geométrico dentro del modelo.
     """
     inputs = tf.keras.Input(shape=IMG_SIZE + (3,))
 
-    # Capas de aumento geométrico (GPU)
+    # Aumentación en GPU
     x = tf.keras.layers.RandomFlip("horizontal")(inputs)
     x = tf.keras.layers.RandomRotation(0.1)(x)
     x = tf.keras.layers.RandomZoom(0.1)(x)
 
-    # Base MobileNetV2
+    # Cargar MobileNetV2 sin la parte final (include_top=False)
     base_model = MobileNetV2(
         input_shape=IMG_SIZE + (3,), include_top=False, weights="imagenet"
     )
-    base_model.trainable = False  # Congelar inicialmente
+    base_model.trainable = False  # Congelar en primera fase
 
-    # Pasamos el input por el base_model
-    # IMPORTANTE: 'training=False' mantiene BatchNorm en modo inferencia
+    # Pasar datos por base_model sin modificar BatchNorm
     x = base_model(x, training=False)
 
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    x = tf.keras.layers.Dropout(0.2)(x)
-    x = tf.keras.layers.Dense(128, activation="relu")(x)
+    # Cabeza de clasificación
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)  # Reduce a vector
+    x = tf.keras.layers.Dropout(0.2)(x)              # Regularización
+    x = tf.keras.layers.Dense(128, activation="relu")(x)  # Capa intermedia
 
     outputs = tf.keras.layers.Dense(NUM_CLASSES, activation="softmax")(x)
 
     model = tf.keras.Model(inputs, outputs)
 
+    # Optimización inicial
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-        loss="sparse_categorical_crossentropy",
+        loss="sparse_categorical_crossentropy",  # Etiquetas como enteros
         metrics=["accuracy"],
     )
     return model
@@ -131,7 +136,7 @@ def main():
     model = create_model()
     model.summary()
 
-    # Checkpoint usa .keras ahora
+    # Checkpoint guardará el mejor modelo
     checkpoint_path = "best_" + MODEL_PATH
 
     callbacks = [
@@ -139,10 +144,7 @@ def main():
             monitor="val_loss", patience=6, restore_best_weights=True
         ),
         tf.keras.callbacks.ModelCheckpoint(
-            checkpoint_path,
-            monitor="val_loss",
-            save_best_only=True,
-            verbose=1,
+            checkpoint_path, monitor="val_loss", save_best_only=True, verbose=1
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss", factor=0.2, patience=3, min_lr=1e-6, verbose=1
@@ -159,25 +161,23 @@ def main():
 
     print("5. Entrenando (Fase 2: Fine-tuning)...")
 
-    # --- FIX: Búsqueda robusta de la capa MobileNet ---
+    # Buscar la capa MobileNetV2 dentro del modelo
     base_model_layer = None
     for layer in model.layers:
-        # Buscamos la capa que sea MobileNetV2 (nombre suele contener 'mobilenet')
-        if "mobilenet" in layer.name.lower():
+        if "mobilenet" in layer.name.lower():  # Búsqueda por nombre
             base_model_layer = layer
             print(f"   -> Capa base encontrada: {layer.name}")
             break
 
     if base_model_layer:
-        base_model_layer.trainable = True
+        base_model_layer.trainable = True  # Descongelar
 
-        # Congelar las primeras capas, entrenar solo las últimas
-        # MobileNetV2 tiene ~155 capas. Entrenamos las últimas 50.
+        # Congelar primeras capas y entrenar últimas capas
         fine_tune_at = 100
         for layer in base_model_layer.layers[:fine_tune_at]:
             layer.trainable = False
 
-        # Re-compilar con learning rate muy bajo es OBLIGATORIO
+        # Recompilar con LR muy bajo para no dañar pesos preentrenados
         model.compile(
             optimizer=tf.keras.optimizers.Adam(1e-5),
             loss="sparse_categorical_crossentropy",
@@ -188,14 +188,14 @@ def main():
         model.fit(
             train_ds,
             validation_data=val_ds,
-            epochs=10,  # Pocas épocas extra
+            epochs=10,
             callbacks=callbacks,
         )
     else:
-        print("   ADVERTENCIA: No se pudo encontrar la capa base para fine-tuning.")
+        print("   ADVERTENCIA: No se encontró la capa base para fine-tuning.")
 
     print("Guardando modelo final...")
-    model.save(MODEL_PATH)  # Guarda en .keras
+    model.save(MODEL_PATH)
     print(f"Modelo guardado en {MODEL_PATH}")
 
 
