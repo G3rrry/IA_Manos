@@ -58,7 +58,7 @@ def preprocess_image(path, label):
 
 def augment(image, label):
     """
-    Aumentación leve en CPU: variaciones de brillo y contraste.
+    Aumentación- leve en CPU: variaciones de brillo y contraste.
     (Aumentos geométricos se hacen dentro del modelo en GPU).
     """
     image = tf.image.random_brightness(image, max_delta=0.1)
